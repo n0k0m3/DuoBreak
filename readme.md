@@ -1,51 +1,102 @@
-# DuoBreak
+# DuoBreak 2.0
 
-DuoBreak is a Python-based solution for handling Duo Push and HOTP authentication. Traditionally, Duo authentication is device-specific, meaning you will be locked out of your account if you lose your Phone (or reset to factory defaults) or lose your security key. However, after reverse-engineering the Duo app, DuoBreak emulates the functionality of a Duo Phone device while making it possible to export your keys to any device or backup service by saving the ".duo" archive to your place of liking, allowing you to authenticate into Duo-protected accounts using only your computer or embedded device (Raspberry Pi) where your Phone or security key is unavailable.
+A modular, CLI-friendly Duo authentication bypass tool with support for both interactive and non-interactive usage.
 
-## Video Tutorial
+## Installation
 
-[![DuoBreak Video Tutorial](https://img.youtube.com/vi/PLACEHOLDER_VIDEO_ID/0.jpg)](https://www.youtube.com/watch?v=PLACEHOLDER_VIDEO_ID)
+```bash
+git clone https://github.com/JesseNaser/DuoBreak.git
+cd DuoBreak
+pip install -r requirements.txt
+chmod +x duobreak.py
+```
 
-## Step-by-Step Tutorial
+## Quick Setup
 
-### Initial Key Setup
+Create a password file and add your first Duo key from a QR code:
 
+```bash
+echo "your_secure_password" > .password
+chmod 600 .password
 
-1. Clone this repository and install the required Python packages:
+./duobreak.py add \
+  --qr-code duo_qr_code.png \
+  --key-name work \
+  --db-path work.duo \
+  --password-file .password
+```
 
-    ```
-    git clone https://github.com/JesseNaser/DuoBreak.git
-    cd DuoBreak
-    pip install -r requirements.txt
-    ```
+## Quick Usage
 
-2. (for macOS only!) Install dependencies:
+```bash
+# Approve push notification
+./duobreak.py push work --password-file .password
 
-    ```
-    brew install zbar
-    sudo ln -s $(brew --prefix zbar)/lib/libzbar.dylib /usr/local/lib/libzbar.dylib
-    ```
+# Generate HOTP code (increments counter)
+./duobreak.py hotp work --password-file .password
 
-3. Run the `duobreak.py` script:
+# View current code without incrementing
+./duobreak.py hotp work --view --password-file .password
 
-    ```
-    python duobreak.py
-    ```
+# List all configured keys
+./duobreak.py list --password-file .password
+```
 
-4. Follow the on-screen instructions to create a new password-protected vault for storing your authentication keys. *Notice your password is hidden from being displayed in the console while typing*.
+## Interactive Mode
 
-5. On your computer, go to the Duo webpage and add a new device. Choose "Tablet" and then "Android" as your device type, and click "I have Duo Mobile installed".
+```bash
+# Launch interactive menu
+./duobreak.py --db-path work.duo
+```
 
-6. Save the QR code image given by the webpage as a PNG file.
+The interactive menu provides:
+- Add/delete keys via QR code or activation code
+- Generate HOTP codes
+- Approve push notifications  
+- Change database password
+- View HOTP history
 
-7. In the DuoBreak script, choose "Add a new key" from the main menu. Enter a nickname for the new key and provide the file path to the saved QR code image.
+## Getting Help
 
-8. The script will automatically activate the new key and store it securely in your vault.
+```bash
+# General help
+./duobreak.py --help
 
-### Authentication
+# Command-specific help
+./duobreak.py <command> --help
+```
 
-To authenticate, choose "Authenticate" from the main menu and enter the nickname of the key you want to use. You can choose to authenticate using Duo push notifications or HOTP codes.
+Examples:
+```bash
+./duobreak.py add --help
+./duobreak.py hotp --help
+./duobreak.py push --help
+```
+
+## Documentation
+
+- **[Usage Examples](docs/USAGE.md)** - Command examples and common use cases
+- **[Quick Reference](docs/QUICK_REFERENCE.md)** - Command cheat sheet
+- **[Complete Guide](docs/COMPLETE_GUIDE.md)** - Full documentation
+
+## Security Best Practices
+
+- Use password files with strict permissions (`chmod 600`)
+- Never use `--password` flag (visible in process list)
+- Store `.duo` databases in a secure location
+- Use password managers for password file content
+
+## Requirements
+
+- Python 3.7+
+- See `requirements.txt` for dependencies
 
 ## License
 
-This project is licensed under the AGPL 3.0 or later license. Please see the [LICENSE](LICENSE) file for more information.
+AGPL-3.0-or-later
+
+For security updates, visit: [github.com/JesseNaser/DuoBreak](https://github.com/JesseNaser/DuoBreak)
+
+---
+
+**Disclaimer:** This tool is for educational and authorized testing purposes only. Ensure you have permission to use this tool on any Duo-protected systems.
