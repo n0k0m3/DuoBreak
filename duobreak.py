@@ -1,524 +1,552 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Version: 1.1.0
+# Version: 2.0.0
 # For security updates, visit github.com/JesseNaser/DuoBreak
 
-from Crypto.Cipher import AES
-from Crypto.Hash import SHA512
-from Crypto.PublicKey import RSA
-from Crypto.Signature import pkcs1_15
-from Crypto.Util.Padding import pad, unpad
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from PIL import Image
-from pyzbar.pyzbar import decode as pyzbar_decode
+"""
+DuoBreak - Duo authentication bypass tool
+Refactored with CLI support and modular architecture.
+"""
+
+import argparse
 import atexit
 import base64
 import datetime
-import email.utils
 import getpass
 import json
-import logging
 import os
 import pyotp
-import requests
-import shutil
 import sys
-import time
-import urllib.parse
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from config_manager import ConfigManager
+from duo_api import (
+    activate_duo, 
+    parse_qr_code, 
+    approve_push_notifications,
+    get_transactions,
+    reply_transaction
+)
 
-VERIFY_SSL = True
 
-
-class DuoAuthenticator:
-    def __init__(self, config_file=None):
-        self.config_file = config_file
-        self.config_version = 1
-        self.config = {}
-        self.encryption_key = None
-        self.select_database()
-        self.load_config()
-
-        if "keys" not in self.config:
-            self.config["keys"] = {}
-            self.save_config()
-
-    def derive_encryption_key(self, password, salt=None):
-        if salt is None:
-            salt = os.urandom(16)
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=100000,
-            backend=default_backend()
-        )
-        return salt, kdf.derive(password.encode("utf-8"))
-
-    def verify_encryption_key(self, key, password, salt):
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=100000,
-            backend=default_backend()
-        )
-        try:
-            kdf.verify(password.encode("utf-8"), key)
-            return True
-        except Exception:
-            return False
-
-    def encrypt_data(self, data, key):
-        cipher = AES.new(key, AES.MODE_CBC)
-        return cipher.iv + cipher.encrypt(pad(data, AES.block_size))
-
-    def decrypt_data(self, encrypted_data, key):
-        iv = encrypted_data[:AES.block_size]
-        cipher = AES.new(key, AES.MODE_CBC, iv)
-        return unpad(cipher.decrypt(encrypted_data[AES.block_size:]), AES.block_size)
-
-    def get_password(self, prompt):
-        password = getpass.getpass(prompt)
-        if len(password) < 8:
-            logger.error("Password must be at least 8 characters long.")
-            return self.get_password(prompt)
-        return password
-
-    def confirm_password(self, prompt):
-        password = self.get_password(prompt)
-        password_confirm = self.get_password("Confirm password: ")
-        if password == password_confirm:
+def get_password_from_stdin():
+    """Read password from stdin if available."""
+    if not sys.stdin.isatty():
+        password = sys.stdin.readline().strip()
+        if password:
             return password
-        else:
+    return None
+
+
+def get_password_interactive(prompt="Enter password: ", confirm=False):
+    """Get password interactively with optional confirmation."""
+    password = getpass.getpass(prompt, stream=sys.stdout)
+    if len(password) < 8:
+        print("Password must be at least 8 characters long.")
+        return get_password_interactive(prompt, confirm)
+    
+    if confirm:
+        password_confirm = getpass.getpass("Confirm password: ", stream=sys.stdout)
+        if password != password_confirm:
             print("Passwords do not match. Please try again.")
-            return self.confirm_password(prompt)
+            return get_password_interactive(prompt, confirm)
+    
+    return password
 
-    def select_database(self):
-        duo_files = [f for f in os.listdir() if f.endswith(".duo")]
-        if duo_files:
-            print("Duo databases found:")
-            for i, file in enumerate(duo_files, 1):
-                print(f"{i}. {file}")
-            while True:
-                try:
-                    choice = int(input("Enter the number corresponding to the database you want to use: "))
-                    if 1 <= choice <= len(duo_files):
-                        self.config_file = duo_files[choice - 1]
-                        break
-                    else:
-                        print("Invalid input. Please enter a valid number.")
-                except ValueError:
-                    print("Invalid input. Please enter a valid number.")
-        else:
-            print("No Duo databases found. Creating a new database.")
-            db_name = input("Enter a name for the new database: ").strip()
-            self.config_file = f"{db_name}.duo"
 
-    def change_password(self):
-        password = self.confirm_password("Enter a new password for the database: ")
-        salt, new_key = self.derive_encryption_key(password)
-        decrypted_data = self.decrypt_data(self.config["encrypted_data"], self.encryption_key)
-        self.config["encrypted_data"] = self.encrypt_data(decrypted_data, new_key)
-        self.encryption_key = new_key
-        self.save_config(salt=salt)  # Make sure that the salt is passed as a keyword argument
-        print("Password changed successfully.")
+def get_password(password_arg=None, password_file=None, allow_stdin=True, interactive_prompt="Enter password: ", confirm=False):
+    """Get password from various sources in order of priority."""
+    # 1. From password file
+    if password_file:
+        with open(password_file, 'r') as f:
+            return f.read().strip()
+    
+    # 2. From command line argument (least secure, but useful for scripts)
+    if password_arg:
+        return password_arg
+    
+    # 3. From stdin pipe
+    if allow_stdin:
+        stdin_password = get_password_from_stdin()
+        if stdin_password:
+            return stdin_password
+    
+    # 4. Interactive prompt
+    return get_password_interactive(interactive_prompt, confirm)
 
-    def load_config(self):
-        attempts = 0
-        while attempts < 3:
-            if os.path.exists(self.config_file):
-                print("Ready for password input.")
-                password = self.get_password("Enter the password to unlock your vault: ")
-                with open(self.config_file, "rb") as f:
-                    version, salt, encrypted_data = f.read(4), f.read(16), f.read()
-                    if version != b"DBv1":
-                        logger.error("Unsupported configuration file version. Exiting...")
-                        sys.exit(1)
 
-                    self.encryption_key = self.derive_encryption_key(password, salt)[1]
-                    if self.verify_encryption_key(self.encryption_key, password, salt):
-                        try:
-                            self.config["encrypted_data"] = encrypted_data
-                            decrypted_data = self.decrypt_data(encrypted_data, self.encryption_key)
-                            self.config.update(json.loads(decrypted_data))
-                            break
-                        except ValueError as e:
-                            logger.error("Incorrect password or corrupted data. Please try again.")
-                            attempts += 1
-                    else:
-                        logger.error("Incorrect password. Please try again.")
-                        attempts += 1
-            else:
-                print("Ready for password input.")
-                password = self.confirm_password("Enter a password to create a new vault: ")
-                salt, self.encryption_key = self.derive_encryption_key(password)
-                self.config = {"keys": {}}
-                self.save_config(salt)
-        if attempts >= 3:
-            logger.error("Reached maximum password attempts. Exiting...")
-            sys.exit(1)
-
-    def import_key(self, keyfile):
-        try:
-            self.pubkey = RSA.import_key(keyfile.encode("utf-8"))
-        except ValueError:
-            with open(keyfile, "rb") as f:
-                self.pubkey = RSA.import_key(f.read())
-
-    def save_config(self, salt=None):
-        if salt is None:
-            with open(self.config_file, "rb") as f:
-                version, salt = f.read(4), f.read(16)
-
-        # Temporarily remove the "encrypted_data" key from the config dictionary, if it exists
-        encrypted_data = self.config.pop("encrypted_data", None)
-
-        # Save the config dictionary without the "encrypted_data" key to a temporary file
-        temp_file = self.config_file + ".tmp"
-        with open(temp_file, "wb") as f:
-            data_to_save = json.dumps(self.config).encode("utf-8")
-            encrypted_data_to_save = self.encrypt_data(data_to_save, self.encryption_key)
-            f.write(b"DBv1" + salt + encrypted_data_to_save)
-
-        # Replace the original Duo file with the temporary file
-        shutil.move(temp_file, self.config_file)
-
-        # Restore the "encrypted_data" key to the config dictionary, if it was removed
-        if encrypted_data is not None:
-            self.config["encrypted_data"] = encrypted_data
-
-    @staticmethod
-    def prompt_activation_code_and_host_name():
-        code = input("Please provide the activation code (leave empty to cancel): ").strip()
-        host = input('Please provide the host name (e.g. "api-e0724a16.duosecurity.com", leave empty to cancel): ').strip()
-        if not code or not host:
-            return None, None
-        else:
-            return code, host
-
-    def prompt_qr_code(self):
-        print("Please provide the QR code image file path (leave empty to cancel): ")
-        file_path = input().strip()
-        if not file_path:
-            return None
-        if os.path.exists(file_path):
-            return file_path
-        else:
-            print("Invalid file path. Please try again.")
-        return self.prompt_qr_code()
-
-    def parse_qr_code(self, file_path):
-        img = Image.open(file_path)
-
-        decoded_data = pyzbar_decode(img)
-        if decoded_data:
-            qr_data = decoded_data[0].data.decode()
-            code, host = map(lambda x: x.strip("<>"), qr_data.split("-"))
-            missing_padding = len(host) % 4
-            if missing_padding:
-                host += "=" * (4 - missing_padding)
-            return code, base64.b64decode(host.encode("ascii")).decode("ascii")
-        else:
-            print("Error: Could not decode the QR code. Please try again.")
-            return None
-
-    def activate(self, code, host):
-        url = f"https://{host}/push/v2/activation/{code}"
-
-        headers = {
-            "User-Agent": "DuoMobileApp/4.73.0.873.1 (arm64; iOS 18.1); Client: Foundation",
-            "Accept": "*/*",
-            "Accept-Language": "en-us",
-            "Accept-Encoding": "gzip, deflate, br"
-            # "Content-Type": "application/x-www-form-urlencoded",
-        }
-
-        key_pair = RSA.generate(2048)
-        pubkey_data = key_pair.publickey().export_key("PEM").decode("ascii")
-        privkey_data = key_pair.export_key("PEM").decode("ascii")
-
-        data = {
-            "app_id": "com.duosecurity.DuoMobile",
-            "app_version": "4.73.0.873.1",
-            "ble_status": "allowed",  # NOTE: can also be "undetermined"
-            "build_version": "24B5055e",
-            "customer_protocol": "1",
-            "device_name": "iPad",
-            "jailbroken": "false",
-            "language": "en",
-            "manufacturer": "Apple",
-            "model": "arm64",
-            "notification_status": "not_determined",
-            "passcode_status": "true",
-            "pkpush": "rsa-sha512",
-            "platform": "iOS",
-            "pubkey": pubkey_data,
-            "region": "US",
-            "security_patch_level": "",
-            "touchid_status": "true",
-            "version": "18.1"
-        }
-
-        r = requests.post(url, headers=headers, data=data, verify=VERIFY_SSL)
-        response = r.json()
-
-        if "response" in response:
-            return response["response"], pubkey_data, privkey_data
-        else:
-            print("Error during activation. Please try again.")
-            print(f"Server response: {response}")
-            sys.exit(1)
-
-    def generate_signature(self, method, path, time, data, key_config):
-        message = (time + "\n" + method + "\n" + key_config["host"].lower() + "\n" +
-                   path + "\n" + urllib.parse.urlencode(data)).encode("ascii")
-
-        h = SHA512.new(message)
-        signature = pkcs1_15.new(self.pubkey).sign(h)
-        auth = ("Basic " + base64.b64encode((key_config["response"]["pkey"] + ":" +
-                                             base64.b64encode(signature).decode("ascii")).encode("ascii")).decode("ascii"))
-        return auth
-
-    def get_transactions(self, key_config):
-        dt = datetime.datetime.utcnow()
-        time = email.utils.format_datetime(dt)
-        path = "/push/v2/device/transactions"
-
-        data = {
-            "akey": key_config["response"]["akey"],
-            "fips_status": "1",
-            "hsm_status": "true",
-            "pkpush": "rsa-sha512"
-        }
-
-        signature = self.generate_signature("GET", path, time, data, key_config)
-
-        headers = {
-            "Authorization": signature,
-            "x-duo-date": time,
-            "host": key_config["host"]
-        }
-
-        r = requests.get(f"https://{key_config['host']}{path}", params=data, headers=headers, verify=VERIFY_SSL)
-
-        return r.json()
-
-    def reply_transaction(self, transaction_id, answer, key_config):
-        dt = datetime.datetime.utcnow()
-        time = email.utils.format_datetime(dt)
-        path = "/push/v2/device/transactions/" + transaction_id
-
-        data = {
-            "akey": key_config["response"]["akey"],
-            "answer": answer,
-            "fips_status": "1",
-            "hsm_status": "true",
-            "pkpush": "rsa-sha512"
-        }
-
-        signature = self.generate_signature("POST", path, time, data, key_config)
-
-        headers = {
-            "Authorization": signature,
-            "x-duo-date": time,
-            "host": key_config["host"],
-            "txId": transaction_id
-        }
-
-        r = requests.post(f"https://{key_config['host']}{path}", data=data, headers=headers, verify=VERIFY_SSL)
-
-        return r.json()
-
-    def approve_push_notifications(self, key_name):
-        key_config = self.config["keys"][key_name]
-        self.import_key(key_config["privkey"])
-
-        if "response" in key_config:
-            failed_attempts = 0
-            while True:
-                if failed_attempts >= 10:
-                    print("Reached 10 failed attempts. Returning to previous menu...")
-                    break
-
-                try:
-                    r = self.get_transactions(key_config)
-                except requests.exceptions.ConnectionError:
-                    print("Connection Error")
-                    time.sleep(5)
-                    continue
-
-                approved = False
-
-                if "response" in r and "transactions" in r["response"]:
-                    transactions = r["response"]["transactions"]
-                    print("Checking for transactions")
-                    if transactions:
-                        for tx in transactions:
-                            print(tx)
-                            reply = self.reply_transaction(tx["urgid"], "approve", key_config)
-                            approved = True
-                            break
-                        if approved:
-                            print("Transaction approved. Returning to previous menu...")
-                            break
-                    else:
-                        print("No transactions")
-                        failed_attempts += 1
-                else:
-                    print(f"Error fetching transactions. Server response: {r}. Retrying...")
-                    failed_attempts += 1
-
-                time.sleep(10)
-        else:
-            print("Error: Activation response is missing. Please try again.")
-            sys.exit(1)
-
-    def show_recent_hotp_codes(self, key_name, count=10):
-        if "hotp_log" in self.config["keys"][key_name]:
-            recent_codes = self.config["keys"][key_name]["hotp_log"][-count:]
-            print(f"Last {count} HOTP codes for {key_name}:")
-            for code in recent_codes:
-                print(code)
-        else:
-            print(f"No recent HOTP codes found for {key_name}.")
-
-    def authenticate(self, key_name):
-        if key_name in self.config["keys"]:
-            print("Select authentication method:")
-            print("1. Duo Push")
-            print("2. HOTP")
-            print("3. Show recent HOTP codes")
-            auth_method = input("Enter the number (1, 2, or 3) corresponding to the method you want to use: ")
-
-            if auth_method == "1":
-                self.approve_push_notifications(key_name)
-            elif auth_method == "2":
-                response = self.config["keys"][key_name]["response"]
-                hotp_secret = base64.b32encode(response["hotp_secret"].encode("ascii")).decode("ascii")
-                hotp = pyotp.HOTP(hotp_secret)
-
-                if "hotp_counter" in self.config["keys"][key_name]:
-                    self.config["keys"][key_name]["hotp_counter"] += 1
-                else:
-                    self.config["keys"][key_name]["hotp_counter"] = 1
-
-                if "hotp_log" not in self.config["keys"][key_name]:
-                    self.config["keys"][key_name]["hotp_log"] = []
-
-                hotp_code = hotp.at(self.config["keys"][key_name]["hotp_counter"])
-                print(f"Generated HOTP code: {hotp_code}")
-
-                self.config["keys"][key_name]["hotp_log"].append(f"{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} ({key_name}): {hotp_code}")
-                self.save_config()
-            elif auth_method == "3":
-                self.show_recent_hotp_codes(key_name)
-            else:
-                print("Invalid input. Please try again.")
-                self.authenticate(key_name)
-        else:
-            print("Error: Key not found. Please try again.")
-            sys.exit(1)
-
-    def main_menu(self):
-        while True:
-            print("\nMain Menu:")
-            print("1. Add a new key using a QR Code")
-            print("2. Add a new key using an activation code and host")
-            print("3. Delete a key")
-            print("4. List keys")
-            print("5. Authenticate")
-            print("6. Change password")
-            print("7. Exit")
-
-            choice = input("Enter the number (1, 2, 3, 4, 5, 6 or 7) corresponding to the action you want to perform: ")
-
-            if choice == "1":
-                self.add_key("qr_code")
-            if choice == "2":
-                self.add_key("activation_code_and_host_name")
-            elif choice == "3":
-                self.delete_key()
-            elif choice == "4":
-                self.list_keys()
-            elif choice == "5":
-                self.authenticate_key()
-            elif choice == "6":
-                self.change_password()
-            elif choice == "7":
-                print("Exiting...")
-                self.save_config()
-                sys.exit(0)
-            else:
-                print("Invalid input. Please try again.")
-
-    def add_key(self, mode):
-        while True:
-            key_name = input("Enter a nickname for the new key (leave empty to cancel): ").strip()
+def cmd_add_key(args, config_manager):
+    """Add a new Duo key."""
+    if args.qr_code:
+        code, host = parse_qr_code(args.qr_code)
+        print(f"Parsed QR code: {code}, {host}")
+    elif args.activation_code and args.host:
+        code = args.activation_code
+        host = args.host
+    else:
+        print("Error: Either --qr-code or both --activation-code and --host are required")
+        return 1
+    
+    key_name = args.key_name
+    if not key_name:
+        if args.interactive:
+            key_name = input("Enter a nickname for the new key: ").strip()
             if not key_name:
-                print("Returning to the main menu.")
-                break
-            if key_name not in self.config["keys"]:
-                if mode == "activation_code_and_host_name":
-                    code, host = self.prompt_activation_code_and_host_name()
-                    if code is not None and host is not None:
-                        response, pubkey, privkey = self.activate(code, host)
-                        self.config["keys"][key_name] = {"code": code, "host": host, "response": response, "pubkey": pubkey, "privkey": privkey}
-                        self.save_config()
-                        print(f"Key '{key_name}' added successfully.")
-                    else:
-                        print("No activation code or host name provided. Returning to the main menu.")
-                    break
-                elif mode == "qr_code":
-                    qr_file_path = self.prompt_qr_code()
-                    if qr_file_path is not None:
-                        parsed_data = self.parse_qr_code(qr_file_path)
-                        if parsed_data is not None:
-                            code, host = parsed_data
-                            response, pubkey, privkey = self.activate(code, host)
-                            self.config["keys"][key_name] = {"code": code, "host": host, "response": response, "pubkey": pubkey, "privkey": privkey}
-                            self.save_config()
-                            print(f"Key '{key_name}' added successfully.")
-                        else:
-                            print("Could not add the key. Returning to the main menu.")
-                    else:
-                        print("No QR code file provided. Returning to the main menu.")
-                    break
-                else:
-                    raise ValueError(f"Invalid mode {mode}")
+                print("Key name is required")
+                return 1
+        else:
+            print("Error: --key-name is required in non-interactive mode")
+            return 1
+    
+    # Check if key already exists
+    if config_manager.get_key(key_name):
+        print(f"Error: Key '{key_name}' already exists")
+        return 1
+    
+    # Activate
+    print(f"Activating Duo key...")
+    response, pubkey, privkey = activate_duo(code, host)
+    
+    # Save
+    config_manager.add_key(key_name, code, host, response, pubkey, privkey)
+    print(f"Key '{key_name}' added successfully")
+    
+    if args.json:
+        print(json.dumps({"status": "success", "key_name": key_name}))
+    
+    return 0
+
+
+def cmd_delete_key(args, config_manager):
+    """Delete a Duo key."""
+    if config_manager.delete_key(args.key_name):
+        print(f"Key '{args.key_name}' deleted successfully")
+        if args.json:
+            print(json.dumps({"status": "success", "key_name": args.key_name}))
+        return 0
+    else:
+        print(f"Error: Key '{args.key_name}' not found")
+        if args.json:
+            print(json.dumps({"status": "error", "message": "Key not found"}))
+        return 1
+
+
+def cmd_list_keys(args, config_manager):
+    """List all configured keys."""
+    keys = config_manager.list_keys()
+    
+    if args.json:
+        key_data = []
+        for key_name in keys:
+            key_config = config_manager.get_key(key_name)
+            key_data.append({
+                "name": key_name,
+                "customer_name": key_config["response"].get("customer_name", ""),
+                "host": key_config.get("host", "")
+            })
+        print(json.dumps({"keys": key_data}))
+    else:
+        if not keys:
+            print("No keys configured")
+        else:
+            print("Configured keys:")
+            for key_name in keys:
+                key_config = config_manager.get_key(key_name)
+                customer_name = key_config["response"].get("customer_name", "Unknown")
+                print(f"  - {key_name} ({customer_name})")
+    
+    return 0
+
+
+def cmd_auth_push(args, config_manager):
+    """Approve Duo push notifications."""
+    key_config = config_manager.get_key(args.key_name)
+    if not key_config:
+        print(f"Error: Key '{args.key_name}' not found")
+        return 1
+    
+    print(f"Polling for push notifications for '{args.key_name}'...")
+    success, tx = approve_push_notifications(
+        key_config, 
+        key_config["privkey"],
+        max_attempts=args.max_attempts,
+        poll_interval=args.poll_interval
+    )
+    
+    if success:
+        print(f"Push notification approved successfully")
+        if args.json:
+            print(json.dumps({"status": "success", "transaction": tx}))
+        return 0
+    else:
+        print(f"No push notifications received or max attempts reached")
+        if args.json:
+            print(json.dumps({"status": "error", "message": "No transactions or timeout"}))
+        return 1
+
+
+def cmd_auth_hotp(args, config_manager):
+    """Generate HOTP code."""
+    key_config = config_manager.get_key(args.key_name)
+    if not key_config:
+        print(f"Error: Key '{args.key_name}' not found")
+        return 1
+    
+    response = key_config["response"]
+    hotp_secret = base64.b32encode(response["hotp_secret"].encode("ascii")).decode("ascii")
+    hotp = pyotp.HOTP(hotp_secret)
+    
+    if args.view:
+        # View mode: get current counter without incrementing
+        counter = config_manager.get_hotp_counter(args.key_name)
+        if counter == 0:
+            print("Warning: No HOTP codes have been generated yet. Counter is at 0.")
+            print("Use without --view flag to generate the first code.")
+            return 1
+        hotp_code = hotp.at(counter)
+        action = "Current"
+    else:
+        # Generate mode: increment counter and generate new code
+        counter = config_manager.increment_hotp_counter(args.key_name)
+        hotp_code = hotp.at(counter)
+        
+        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        config_manager.log_hotp_code(args.key_name, hotp_code, timestamp)
+        action = "Generated"
+    
+    if args.json:
+        print(json.dumps({
+            "status": "success",
+            "code": hotp_code,
+            "counter": counter,
+            "action": action.lower()
+        }))
+    else:
+        print(f"{action} HOTP code: {hotp_code} (counter: {counter})")
+    
+    return 0
+
+
+def cmd_show_hotp_history(args, config_manager):
+    """Show recent HOTP codes."""
+    key_config = config_manager.get_key(args.key_name)
+    if not key_config:
+        print(f"Error: Key '{args.key_name}' not found")
+        return 1
+    
+    recent_codes = config_manager.get_recent_hotp_codes(args.key_name, args.count)
+    
+    if args.json:
+        print(json.dumps({"status": "success", "codes": recent_codes}))
+    else:
+        if not recent_codes:
+            print(f"No HOTP history for '{args.key_name}'")
+        else:
+            print(f"Recent HOTP codes for '{args.key_name}':")
+            for code_entry in recent_codes:
+                print(f"  {code_entry}")
+    
+    return 0
+
+
+def cmd_change_password(args, config_manager):
+    """Change database password."""
+    new_password = get_password(
+        args.new_password,
+        None,  # Don't use password file for new password
+        allow_stdin=False,
+        interactive_prompt="Enter new password: ",
+        confirm=True
+    )
+    
+    config_manager.change_password(new_password)
+    print("Password changed successfully")
+    
+    if args.json:
+        print(json.dumps({"status": "success"}))
+    
+    return 0
+
+
+def interactive_mode(config_manager):
+    """Run in interactive menu mode (legacy compatibility)."""
+    def interactive_add_key():
+        print("\n1. Add using QR Code")
+        print("2. Add using Activation Code and Host")
+        choice = input("Select method (1 or 2): ").strip()
+        
+        key_name = input("Enter a nickname for the new key: ").strip()
+        if not key_name:
+            print("Key name cannot be empty")
+            return
+        
+        if config_manager.get_key(key_name):
+            print(f"Error: Key '{key_name}' already exists")
+            return
+        
+        if choice == "1":
+            try:
+                from pyzbar.pyzbar import decode as pyzbar_decode
+            except ImportError:
+                print("Error: pyzbar is required for QR code parsing")
+                print("Install it with: pip install pyzbar")
+                return
+            
+            qr_path = input("Enter QR code image path: ").strip()
+            if not qr_path or not os.path.exists(qr_path):
+                print("Invalid file path")
+                return
+            
+            code, host = parse_qr_code(qr_path)
+        elif choice == "2":
+            code = input("Enter activation code: ").strip()
+            host = input("Enter host (e.g., api-xxxxx.duosecurity.com): ").strip()
+        else:
+            print("Invalid choice")
+            return
+        
+        print("Activating...")
+        response, pubkey, privkey = activate_duo(code, host)
+        config_manager.add_key(key_name, code, host, response, pubkey, privkey)
+        print(f"Key '{key_name}' added successfully")
+    
+    def interactive_authenticate():
+        key_name = input("Enter key name: ").strip()
+        key_config = config_manager.get_key(key_name)
+        
+        if not key_config:
+            print(f"Error: Key '{key_name}' not found")
+            return
+        
+        print("\n1. Duo Push")
+        print("2. HOTP")
+        print("3. Show recent HOTP codes")
+        choice = input("Select method (1, 2, or 3): ").strip()
+        
+        if choice == "1":
+            print("Polling for push notifications...")
+            success, tx = approve_push_notifications(key_config, key_config["privkey"])
+            if success:
+                print("Push approved successfully")
             else:
-                print("Error: Key with the same name already exists. Please try again.")
-
-    def delete_key(self):
-        key_name = input("Enter the nickname of the key you want to delete: ")
-        if key_name in self.config["keys"]:
-            del self.config["keys"][key_name]
-            self.save_config()
-            print(f"Key '{key_name}' deleted successfully.")
+                print("No transactions or timeout")
+        
+        elif choice == "2":
+            response = key_config["response"]
+            hotp_secret = base64.b32encode(response["hotp_secret"].encode("ascii")).decode("ascii")
+            hotp = pyotp.HOTP(hotp_secret)
+            
+            counter = config_manager.increment_hotp_counter(key_name)
+            hotp_code = hotp.at(counter)
+            
+            timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            config_manager.log_hotp_code(key_name, hotp_code, timestamp)
+            
+            print(f"HOTP code: {hotp_code}")
+        
+        elif choice == "3":
+            recent_codes = config_manager.get_recent_hotp_codes(key_name)
+            if recent_codes:
+                print(f"Recent HOTP codes for '{key_name}':")
+                for code_entry in recent_codes:
+                    print(f"  {code_entry}")
+            else:
+                print(f"No HOTP history for '{key_name}'")
+    
+    while True:
+        print("\n=== DuoBreak Main Menu ===")
+        print("1. Add a new key")
+        print("2. Delete a key")
+        print("3. List keys")
+        print("4. Authenticate")
+        print("5. Change password")
+        print("6. Exit")
+        
+        choice = input("\nEnter your choice (1-6): ").strip()
+        
+        if choice == "1":
+            interactive_add_key()
+        elif choice == "2":
+            key_name = input("Enter key name to delete: ").strip()
+            if config_manager.delete_key(key_name):
+                print(f"Key '{key_name}' deleted")
+            else:
+                print(f"Key '{key_name}' not found")
+        elif choice == "3":
+            keys = config_manager.list_keys()
+            if keys:
+                print("\nConfigured keys:")
+                for key_name in keys:
+                    key_config = config_manager.get_key(key_name)
+                    customer_name = key_config["response"].get("customer_name", "Unknown")
+                    print(f"  - {key_name} ({customer_name})")
+            else:
+                print("No keys configured")
+        elif choice == "4":
+            interactive_authenticate()
+        elif choice == "5":
+            new_password = get_password_interactive("Enter new password: ", confirm=True)
+            config_manager.change_password(new_password)
+            print("Password changed successfully")
+        elif choice == "6":
+            print("Exiting...")
+            return 0
         else:
-            print("Error: Key not found. Please try again.")
+            print("Invalid choice")
 
-    def list_keys(self):
-        print("Keys:")
-        for key_name in self.config["keys"]:
-            print(f"- {key_name} ({self.config['keys'][key_name]['response']['customer_name']})")
 
-    def authenticate_key(self):
-        key_name = input("Enter the nickname of the key you want to use for authentication: ")
-        if key_name in self.config["keys"]:
-            self.authenticate(key_name)
+def main():
+    parser = argparse.ArgumentParser(
+        description="DuoBreak - Duo authentication tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Interactive mode
+  duobreak.py --db-path work.duo
+
+  # Add key from QR code
+  echo "mypassword" | duobreak.py add --qr-code qr.png --key-name work
+
+  # Add key with activation code
+  duobreak.py add --activation-code ABC123 --host api-xxx.duosecurity.com --key-name personal --password-file .pass
+
+  # List keys
+  duobreak.py list --db-path ~/duo/work.duo
+
+  # Generate HOTP code (increments counter)
+  duobreak.py hotp work
+
+  # View current HOTP code (without incrementing)
+  duobreak.py hotp work --view
+
+  # Approve push notification
+  duobreak.py push work
+
+  # Show HOTP history
+  duobreak.py hotp-history work --count 20
+        """
+    )
+    
+    # Global options
+    parser.add_argument("--db-path", help="Path to .duo database file (required for interactive mode)")
+    parser.add_argument("--password", help="Database password (NOT RECOMMENDED - use stdin or --password-file instead)")
+    parser.add_argument("--password-file", help="Path to file containing database password")
+    parser.add_argument("--json", action="store_true", help="Output in JSON format")
+    parser.add_argument("--interactive", action="store_true", help="Enable interactive prompts when needed")
+    
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+    
+    # Add key command
+    add_parser = subparsers.add_parser("add", help="Add a new Duo key")
+    add_parser.add_argument("--key-name", help="Nickname for the key")
+    add_parser.add_argument("--qr-code", help="Path to QR code image")
+    add_parser.add_argument("--activation-code", help="Activation code")
+    add_parser.add_argument("--host", help="Duo host (e.g., api-xxxxx.duosecurity.com)")
+    
+    # Delete key command
+    delete_parser = subparsers.add_parser("delete", help="Delete a Duo key")
+    delete_parser.add_argument("key_name", help="Name of the key to delete")
+    
+    # List keys command
+    list_parser = subparsers.add_parser("list", help="List all configured keys")
+    
+    # Push authentication command
+    push_parser = subparsers.add_parser("push", help="Approve Duo push notification")
+    push_parser.add_argument("key_name", help="Name of the key to use")
+    push_parser.add_argument("--max-attempts", type=int, default=10, help="Maximum polling attempts (default: 10)")
+    push_parser.add_argument("--poll-interval", type=int, default=10, help="Seconds between polls (default: 10)")
+    
+    # HOTP command
+    hotp_parser = subparsers.add_parser("hotp", help="Generate HOTP code")
+    hotp_parser.add_argument("key_name", help="Name of the key to use")
+    hotp_parser.add_argument("--view", action="store_true", help="View current code without incrementing counter")
+    
+    # HOTP history command
+    history_parser = subparsers.add_parser("hotp-history", help="Show recent HOTP codes")
+    history_parser.add_argument("key_name", help="Name of the key")
+    history_parser.add_argument("--count", type=int, default=10, help="Number of recent codes to show (default: 10)")
+    
+    # Change password command
+    passwd_parser = subparsers.add_parser("change-password", help="Change database password")
+    passwd_parser.add_argument("--new-password", help="New password (NOT RECOMMENDED - use interactive prompt instead)")
+    
+    args = parser.parse_args()
+    
+    # If no command specified, run interactive mode
+    if not args.command:
+        # Interactive mode - db-path is REQUIRED
+        if not args.db_path:
+            parser.error("--db-path is required for interactive mode\n\nExamples:\n  duobreak.py --db-path work.duo\n  duobreak.py --db-path /path/to/database.duo")
+        
+        config_manager = ConfigManager(args.db_path)
+        
+        # Get password
+        if os.path.exists(config_manager.db_path):
+            password = get_password(args.password, args.password_file, interactive_prompt="Enter password to unlock vault: ")
         else:
-            print("Error: Key not found. Please try again.")
-
-    def delete_encryption_key_from_memory(self):
-        self.encryption_key = None
+            password = get_password_interactive("Enter password to create new vault: ", confirm=True)
+        
+        config_manager.load_config(password)
+        
+        # Clean up password from memory
+        def cleanup():
+            config_manager.encryption_key = None
+        atexit.register(cleanup)
+        
+        return interactive_mode(config_manager)
+    
+    # CLI mode - determine database path
+    if args.db_path:
+        db_path = args.db_path
+    else:
+        # Look for .duo files in current directory
+        duo_files = [f for f in os.listdir(".") if f.endswith(".duo")]
+        if len(duo_files) == 1:
+            db_path = duo_files[0]
+        elif len(duo_files) > 1:
+            print(f"Error: Multiple .duo files found. Please specify --db-path")
+            return 1
+        else:
+            print(f"Error: No .duo files found. Please specify --db-path or create a database first")
+            return 1
+    
+    # Initialize config manager
+    config_manager = ConfigManager(db_path)
+    
+    # Get password
+    if os.path.exists(db_path):
+        password = get_password(args.password, args.password_file, interactive_prompt=f"Enter password for {db_path}: ")
+    else:
+        password = get_password(args.password, args.password_file, interactive_prompt=f"Enter password to create {db_path}: ", confirm=True)
+    
+    try:
+        config_manager.load_config(password)
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+    
+    # Clean up password from memory
+    def cleanup():
+        config_manager.encryption_key = None
+    atexit.register(cleanup)
+    
+    # Execute command
+    if args.command == "add":
+        return cmd_add_key(args, config_manager)
+    elif args.command == "delete":
+        return cmd_delete_key(args, config_manager)
+    elif args.command == "list":
+        return cmd_list_keys(args, config_manager)
+    elif args.command == "push":
+        return cmd_auth_push(args, config_manager)
+    elif args.command == "hotp":
+        return cmd_auth_hotp(args, config_manager)
+    elif args.command == "hotp-history":
+        return cmd_show_hotp_history(args, config_manager)
+    elif args.command == "change-password":
+        return cmd_change_password(args, config_manager)
+    
+    return 0
 
 
 if __name__ == "__main__":
-    authenticator = DuoAuthenticator()
-    atexit.register(authenticator.delete_encryption_key_from_memory)
-    authenticator.main_menu()
+    sys.exit(main())
