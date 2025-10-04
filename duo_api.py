@@ -88,11 +88,11 @@ def parse_qr_code(file_path):
         raise ValueError("Could not decode the QR code")
 
 
-def generate_signature(method, path, timestamp, data, pkey, privkey_pem):
+def generate_signature(method, path, timestamp, host, data, pkey, privkey_pem):
     """Generate a signature for Duo API requests."""
     pubkey = RSA.import_key(privkey_pem.encode("utf-8"))
     
-    message = (timestamp + "\n" + method + "\n" + data["host"].lower() + "\n" +
+    message = (timestamp + "\n" + method + "\n" + host.lower() + "\n" +
                path + "\n" + urllib.parse.urlencode(data)).encode("ascii")
     h = SHA512.new(message)
     signature = pkcs1_15.new(pubkey).sign(h)
@@ -111,11 +111,10 @@ def get_transactions(key_config, privkey_pem):
         "akey": key_config["response"]["akey"],
         "fips_status": "1",
         "hsm_status": "true",
-        "pkpush": "rsa-sha512",
-        "host": key_config["host"]
+        "pkpush": "rsa-sha512"
     }
 
-    signature = generate_signature("GET", path, timestamp, data, 
+    signature = generate_signature("GET", path, timestamp, key_config["host"], data,
                                    key_config["response"]["pkey"], privkey_pem)
     
     headers = {
@@ -124,11 +123,8 @@ def get_transactions(key_config, privkey_pem):
         "host": key_config["host"]
     }
 
-    # Remove 'host' from data for the params
-    params_data = {k: v for k, v in data.items() if k != "host"}
-
     r = requests.get(f"https://{key_config['host']}{path}", 
-                     params=params_data, headers=headers, verify=VERIFY_SSL)
+                     params=data, headers=headers, verify=VERIFY_SSL)
     return r.json()
 
 
@@ -143,11 +139,10 @@ def reply_transaction(transaction_id, answer, key_config, privkey_pem):
         "answer": answer,
         "fips_status": "1",
         "hsm_status": "true",
-        "pkpush": "rsa-sha512",
-        "host": key_config["host"]
+        "pkpush": "rsa-sha512"
     }
 
-    signature = generate_signature("POST", path, timestamp, data,
+    signature = generate_signature("POST", path, timestamp, key_config["host"], data,
                                    key_config["response"]["pkey"], privkey_pem)
 
     headers = {
@@ -157,11 +152,8 @@ def reply_transaction(transaction_id, answer, key_config, privkey_pem):
         "txId": transaction_id
     }
 
-    # Remove 'host' from data for the POST body
-    post_data = {k: v for k, v in data.items() if k != "host"}
-
     r = requests.post(f"https://{key_config['host']}{path}", 
-                      data=post_data, headers=headers, verify=VERIFY_SSL)
+                      data=data, headers=headers, verify=VERIFY_SSL)
     return r.json()
 
 
