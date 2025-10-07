@@ -123,8 +123,19 @@ def get_transactions(key_config, privkey_pem):
         "host": key_config["host"]
     }
 
-    r = requests.get(f"https://{key_config['host']}{path}", 
-                     params=data, headers=headers, verify=VERIFY_SSL)
+#    r = requests.get(f"https://{key_config['host']}{path}", 
+#                     params=data, headers=headers, verify=VERIFY_SSL)
+    # DEBUG: Use PreparedRequest to see exactly what's being sent
+    req = requests.Request('GET', f"https://{key_config['host']}{path}", params=data, headers=headers)
+    prepared = req.prepare()
+    
+#    print("DEBUG - Prepared headers:")
+#    for k, v in prepared.headers.items():
+#        print(f"  {k}: {repr(v)}")
+#    print(f"DEBUG - Full URL: {prepared.url}")
+    
+    s = requests.Session()
+    r = s.send(prepared, verify=VERIFY_SSL)
     return r.json()
 
 
@@ -152,8 +163,12 @@ def reply_transaction(transaction_id, answer, key_config, privkey_pem):
         "txId": transaction_id
     }
 
-    r = requests.post(f"https://{key_config['host']}{path}", 
-                      data=data, headers=headers, verify=VERIFY_SSL)
+    #r = requests.post(f"https://{key_config['host']}{path}", 
+    #                  data=data, headers=headers, verify=VERIFY_SSL)
+    req = requests.Request('POST', f"https://{key_config['host']}{path}", params=data, headers=headers)
+    prepared = req.prepare()
+    s = requests.Session()
+    r = s.send(prepared, verify=VERIFY_SSL)
     return r.json()
 
 
